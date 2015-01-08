@@ -5,6 +5,7 @@
  * Copyright (C) 2010 Antti Seppälä <a.seppala@gmail.com>
  * Copyright (C) 2010 Roman Yeryomin <roman@advem.lv>
  * Copyright (C) 2011 Colin Leitner <colin.leitner@googlemail.com>
+ * Copyright (C) 2010 Luca Niccoli <lultimouomo@gmail.com>
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License version 2 as published
@@ -24,7 +25,7 @@
 #include "rtl8366_smi.h"
 
 #define RTL8366RB_DRIVER_DESC	"Realtek RTL8366RB ethernet switch driver"
-#define RTL8366RB_DRIVER_VER	"0.2.4"
+#define RTL8366RB_DRIVER_VER	"0.2.4a"
 
 #define RTL8366RB_PHY_NO_MAX	4
 #define RTL8366RB_PHY_PAGE_MAX	7
@@ -194,7 +195,7 @@
 #define RTL8366RB_EB_PREIFG_OFFSET	9
 #define RTL8366RB_EB_PREIFG_MASK	(1 << RTL8366RB_EB_PREIFG_OFFSET)
 
-#define RTL8366RB_BDTH_SW_MAX		1048512
+#define RTL8366RB_BDTH_SW_MAX		1048576
 #define RTL8366RB_BDTH_UNIT		64
 #define RTL8366RB_BDTH_REG_DEFAULT	16383
 
@@ -204,6 +205,25 @@
 /* Include/Exclude Preamble and IFG (20 bytes). 0:Exclude, 1:Include. */
 #define RTL8366RB_QOS_DEFAULT_PREIFG	1
 
+/* Port-based priority register */
+#define RTL8366RB_PORT_PRIORITY_BASE		0x020C
+#define RTL8366RB_PORT_PRIORITY_BITS		3
+#define RTL8366RB_PORT_PRIORITY_MASK		0x7
+
+/* Storm Control Register
+ * Filter for: broadcast, multicast, unknown address, unknown multicast
+ */
+#define RTL8366RB_STORM_BC_REG		0x03E0
+#define RTL8366RB_STORM_MC_REG		0x03E1
+#define RTL8366RB_STORM_UA_REG		0x03E2
+#define RTL8366RB_STORM_UM_REG		0x03E3
+#define RTL8366RB_STORM_PORT_MASK(pnum)	(1 << pnum)
+#define RTL8366RB_STORM_RATE_BASE	0x03E4
+#define RTL8366RB_STORM_RATE_REG(pnum)	(RTL8366RB_STORM_RATE_BASE + pnum)
+#define RTL8366RB_STORM_RATE_MASK	0x3FFF
+#define RTL8366RB_STORM_RATE_MAX	1048576
+#define RTL8366RB_STORM_RATE_UNIT	64
+#define RTL8366RB_STORM_RATE_DEFAULT	0
 
 static struct rtl8366_mib_counter rtl8366rb_mib_counters[] = {
 	{ 0,  0, 4, "IfInOctets"				},
@@ -661,6 +681,48 @@ static int rtl8366rb_sw_set_blinkrate(struct switch_dev *dev,
 				val->value.i);
 }
 
+static int rtl8366rb_sw_get_max_length(struct switch_dev *dev,
+				     const struct switch_attr *attr,
+				     struct switch_val *val)
+{
+	struct rtl8366_smi *smi = sw_to_rtl8366_smi(dev);
+	u32 data;
+
+	rtl8366_smi_read_reg(smi, RTL8366RB_SGCR, &data);
+
+	val->value.i = ((data & (RTL8366RB_SGCR_MAX_LENGTH_MASK)) >> 4);
+
+	return 0;
+}
+
+static int rtl8366rb_sw_set_max_length(struct switch_dev *dev,
+				    const struct switch_attr *attr,
+				    struct switch_val *val)
+{
+	struct rtl8366_smi *smi = sw_to_rtl8366_smi(dev);
+	char length_code;
+
+	switch (val->value.i) {
+		case 0:
+			length_code = RTL8366RB_SGCR_MAX_LENGTH_1522;
+			break;
+		case 1:
+			length_code = RTL8366RB_SGCR_MAX_LENGTH_1536;
+			break;
+		case 2:
+			length_code = RTL8366RB_SGCR_MAX_LENGTH_1552;
+			break;
+		case 3:
+			length_code = RTL8366RB_SGCR_MAX_LENGTH_9216;
+			break;
+		default:
+			return -EINVAL;
+	}
+	return rtl8366_smi_rmwr(smi, RTL8366RB_SGCR,
+				RTL8366RB_SGCR_MAX_LENGTH_MASK,
+				length_code);
+}
+
 static int rtl8366rb_sw_get_learning_enable(struct switch_dev *dev,
 				       const struct switch_attr *attr,
 				       struct switch_val *val)
@@ -781,6 +843,61 @@ static int rtl8366rb_sw_get_port_led(struct switch_dev *dev,
 	return 0;
 }
 
+static int rtl8366rb_sw_set_port_pri(struct switch_dev *dev,
+				    const struct switch_attr *attr,
+				    struct switch_val *val)
+{
+	struct rtl8366_smi *smi = sw_to_rtl8366_smi(dev);
+	u32 mask;
+	u32 reg;
+	u32 data;
+
+	if (val->port_vlan >= RTL8366RB_NUM_PORTS || val->value.i > attr->max)
+		return -EINVAL;
+
+	if (val->port_vlan < 5) {
+		mask = RTL8366RB_PORT_PRIORITY_MASK <<
+				(RTL8366RB_PORT_PRIORITY_BITS * val->port_vlan);
+		reg = RTL8366RB_PORT_PRIORITY_BASE;
+		data = val->value.i <<
+				(RTL8366RB_PORT_PRIORITY_BITS * val->port_vlan);
+	} else {
+		mask = RTL8366RB_PORT_PRIORITY_MASK;
+		reg = RTL8366RB_PORT_PRIORITY_BASE + 1;
+		data = val->value.i;
+	}
+
+	return rtl8366_smi_rmwr(smi, reg, mask, data);
+}
+
+static int rtl8366rb_sw_get_port_pri(struct switch_dev *dev,
+				    const struct switch_attr *attr,
+				    struct switch_val *val)
+{
+	struct rtl8366_smi *smi = sw_to_rtl8366_smi(dev);
+	u32 reg;
+	u32 shift;
+	u32 data = 0;
+
+	if (val->port_vlan >= RTL8366RB_NUM_PORTS)
+		return -EINVAL;
+
+	if (val->port_vlan < 5) {
+		reg = RTL8366RB_PORT_PRIORITY_BASE;
+		shift = RTL8366RB_PORT_PRIORITY_BITS * val->port_vlan;
+
+	} else {
+		reg = RTL8366RB_PORT_PRIORITY_BASE + 1;
+		shift = 0;
+	}
+
+	rtl8366_smi_read_reg(smi, reg, &data);
+
+	val->value.i = ((data >> shift) & RTL8366RB_PORT_PRIORITY_MASK);
+
+	return 0;
+}
+
 static int rtl8366rb_sw_set_port_disable(struct switch_dev *dev,
 				    const struct switch_attr *attr,
 				    struct switch_val *val)
@@ -825,12 +942,11 @@ static int rtl8366rb_sw_set_port_rate_in(struct switch_dev *dev,
 {
 	struct rtl8366_smi *smi = sw_to_rtl8366_smi(dev);
 
-	if (val->port_vlan >= RTL8366RB_NUM_PORTS)
+	if (val->port_vlan >= RTL8366RB_NUM_PORTS || val->value.i > attr->max)
 		return -EINVAL;
 
-	if (val->value.i > 0 && val->value.i < RTL8366RB_BDTH_SW_MAX)
-		val->value.i = (val->value.i - 1) / RTL8366RB_BDTH_UNIT;
-	else
+	val->value.i = (val->value.i - 1) / RTL8366RB_BDTH_UNIT;
+	if (val->value.i < 0)
 		val->value.i = RTL8366RB_BDTH_REG_DEFAULT;
 
 	return rtl8366_smi_rmwr(smi, RTL8366RB_IB_REG(val->port_vlan),
@@ -852,8 +968,7 @@ static int rtl8366rb_sw_get_port_rate_in(struct switch_dev *dev,
 
 	rtl8366_smi_read_reg(smi, RTL8366RB_IB_REG(val->port_vlan), &data);
 	data &= RTL8366RB_IB_BDTH_MASK;
-	if (data < RTL8366RB_IB_BDTH_MASK)
-		data += 1;
+	data += 1;
 
 	val->value.i = (int)data * RTL8366RB_BDTH_UNIT;
 
@@ -866,16 +981,15 @@ static int rtl8366rb_sw_set_port_rate_out(struct switch_dev *dev,
 {
 	struct rtl8366_smi *smi = sw_to_rtl8366_smi(dev);
 
-	if (val->port_vlan >= RTL8366RB_NUM_PORTS)
+	if (val->port_vlan >= RTL8366RB_NUM_PORTS || val->value.i > attr->max)
 		return -EINVAL;
 
 	rtl8366_smi_rmwr(smi, RTL8366RB_EB_PREIFG_REG,
 		RTL8366RB_EB_PREIFG_MASK,
 		(RTL8366RB_QOS_DEFAULT_PREIFG << RTL8366RB_EB_PREIFG_OFFSET));
 
-	if (val->value.i > 0 && val->value.i < RTL8366RB_BDTH_SW_MAX)
-		val->value.i = (val->value.i - 1) / RTL8366RB_BDTH_UNIT;
-	else
+	val->value.i = (val->value.i - 1) / RTL8366RB_BDTH_UNIT;
+	if (val->value.i < 0)
 		val->value.i = RTL8366RB_BDTH_REG_DEFAULT;
 
 	return rtl8366_smi_rmwr(smi, RTL8366RB_EB_REG(val->port_vlan),
@@ -895,10 +1009,172 @@ static int rtl8366rb_sw_get_port_rate_out(struct switch_dev *dev,
 
 	rtl8366_smi_read_reg(smi, RTL8366RB_EB_REG(val->port_vlan), &data);
 	data &= RTL8366RB_EB_BDTH_MASK;
-	if (data < RTL8366RB_EB_BDTH_MASK)
-		data += 1;
+	data += 1;
 
 	val->value.i = (int)data * RTL8366RB_BDTH_UNIT;
+
+	return 0;
+}
+
+static int rtl8366rb_sw_set_port_bc_stfilter(struct switch_dev *dev,
+					     const struct switch_attr *attr,
+					     struct switch_val *val)
+{
+	struct rtl8366_smi *smi = sw_to_rtl8366_smi(dev);
+
+	if (val->port_vlan >= RTL8366RB_NUM_PORTS || val->value.i > attr->max)
+		return -EINVAL;
+
+	return rtl8366_smi_rmwr(smi, RTL8366RB_STORM_BC_REG,
+				RTL8366RB_STORM_PORT_MASK(val->port_vlan),
+				(val->value.i << val->port_vlan));
+}
+
+static int rtl8366rb_sw_get_port_bc_stfilter(struct switch_dev *dev,
+					     const struct switch_attr *attr,
+					     struct switch_val *val)
+{
+	struct rtl8366_smi *smi = sw_to_rtl8366_smi(dev);
+	u32 data;
+
+	if (val->port_vlan >= RTL8366RB_NUM_PORTS)
+		return -EINVAL;
+
+	rtl8366_smi_read_reg(smi, RTL8366RB_STORM_BC_REG, &data);
+	val->value.i= (data & RTL8366RB_STORM_PORT_MASK(val->port_vlan))
+		       >> val->port_vlan;
+
+	return 0;
+}
+
+static int rtl8366rb_sw_set_port_mc_stfilter(struct switch_dev *dev,
+					     const struct switch_attr *attr,
+					     struct switch_val *val)
+{
+	struct rtl8366_smi *smi = sw_to_rtl8366_smi(dev);
+
+	if (val->port_vlan >= RTL8366RB_NUM_PORTS || val->value.i > attr->max)
+		return -EINVAL;
+
+	return rtl8366_smi_rmwr(smi, RTL8366RB_STORM_MC_REG,
+				RTL8366RB_STORM_PORT_MASK(val->port_vlan),
+				(val->value.i << val->port_vlan));
+}
+
+static int rtl8366rb_sw_get_port_mc_stfilter(struct switch_dev *dev,
+					     const struct switch_attr *attr,
+					     struct switch_val *val)
+{
+	struct rtl8366_smi *smi = sw_to_rtl8366_smi(dev);
+	u32 data;
+
+	if (val->port_vlan >= RTL8366RB_NUM_PORTS)
+		return -EINVAL;
+
+	rtl8366_smi_read_reg(smi, RTL8366RB_STORM_MC_REG, &data);
+	val->value.i= (data & RTL8366RB_STORM_PORT_MASK(val->port_vlan))
+		       >> val->port_vlan;
+
+	return 0;
+}
+
+static int rtl8366rb_sw_set_port_ua_stfilter(struct switch_dev *dev,
+					     const struct switch_attr *attr,
+					     struct switch_val *val)
+{
+	struct rtl8366_smi *smi = sw_to_rtl8366_smi(dev);
+
+	if (val->port_vlan >= RTL8366RB_NUM_PORTS || val->value.i > attr->max)
+		return -EINVAL;
+
+	return rtl8366_smi_rmwr(smi, RTL8366RB_STORM_UA_REG,
+				RTL8366RB_STORM_PORT_MASK(val->port_vlan),
+				(val->value.i << val->port_vlan));
+}
+
+static int rtl8366rb_sw_get_port_ua_stfilter(struct switch_dev *dev,
+					     const struct switch_attr *attr,
+					     struct switch_val *val)
+{
+	struct rtl8366_smi *smi = sw_to_rtl8366_smi(dev);
+	u32 data;
+
+	if (val->port_vlan >= RTL8366RB_NUM_PORTS)
+		return -EINVAL;
+
+	rtl8366_smi_read_reg(smi, RTL8366RB_STORM_UA_REG, &data);
+	val->value.i= (data & RTL8366RB_STORM_PORT_MASK(val->port_vlan))
+		       >> val->port_vlan;
+
+	return 0;
+}
+
+static int rtl8366rb_sw_set_port_um_stfilter(struct switch_dev *dev,
+					     const struct switch_attr *attr,
+					     struct switch_val *val)
+{
+	struct rtl8366_smi *smi = sw_to_rtl8366_smi(dev);
+
+	if (val->port_vlan >= RTL8366RB_NUM_PORTS || val->value.i > attr->max)
+		return -EINVAL;
+
+	return rtl8366_smi_rmwr(smi, RTL8366RB_STORM_UM_REG,
+				RTL8366RB_STORM_PORT_MASK(val->port_vlan),
+				(val->value.i << val->port_vlan));
+}
+
+static int rtl8366rb_sw_get_port_um_stfilter(struct switch_dev *dev,
+					     const struct switch_attr *attr,
+					     struct switch_val *val)
+{
+	struct rtl8366_smi *smi = sw_to_rtl8366_smi(dev);
+	u32 data;
+
+	if (val->port_vlan >= RTL8366RB_NUM_PORTS)
+		return -EINVAL;
+
+	rtl8366_smi_read_reg(smi, RTL8366RB_STORM_UM_REG, &data);
+	val->value.i= (data & RTL8366RB_STORM_PORT_MASK(val->port_vlan))
+		       >> val->port_vlan;
+
+	return 0;
+}
+
+static int rtl8366rb_sw_set_port_stfilter_rate(struct switch_dev *dev,
+					       const struct switch_attr *attr,
+					       struct switch_val *val)
+{
+	struct rtl8366_smi *smi = sw_to_rtl8366_smi(dev);
+
+	if (val->port_vlan >= RTL8366RB_NUM_PORTS || val->value.i > attr->max)
+		return -EINVAL;
+
+	val->value.i = (val->value.i - 1) / RTL8366RB_STORM_RATE_UNIT;
+	if (val->value.i < 0)
+		val->value.i = RTL8366RB_STORM_RATE_DEFAULT;
+
+	return rtl8366_smi_rmwr(smi, RTL8366RB_STORM_RATE_REG(val->port_vlan),
+				RTL8366RB_STORM_RATE_MASK,
+				val->value.i);
+}
+
+static int rtl8366rb_sw_get_port_stfilter_rate(struct switch_dev *dev,
+					       const struct switch_attr *attr,
+					       struct switch_val *val)
+{
+	struct rtl8366_smi *smi = sw_to_rtl8366_smi(dev);
+	u32 data;
+
+	if (val->port_vlan >= RTL8366RB_NUM_PORTS)
+		return -EINVAL;
+
+	rtl8366_smi_read_reg(smi, RTL8366RB_STORM_RATE_REG(val->port_vlan),
+			     &data);
+
+	data &= RTL8366RB_STORM_RATE_MASK;
+	data += 1;
+
+	val->value.i = data * RTL8366RB_STORM_RATE_UNIT;
 
 	return 0;
 }
@@ -1167,6 +1443,14 @@ static struct switch_attr rtl8366rb_globals[] = {
 		.max = 1
 	}, {
 		.type = SWITCH_TYPE_INT,
+		.name = "max_length",
+		.description = "Get/Set the maximum length of valid packets"
+		" (0 = 1522, 1 = 1536, 2 = 1552, 3 = 9216)",
+		.set = rtl8366rb_sw_set_max_length,
+		.get = rtl8366rb_sw_get_max_length,
+		.max = 3,
+	}, {
+		.type = SWITCH_TYPE_INT,
 		.name = "enable_mirror_rx",
 		.description = "Enable mirroring of RX packets",
 		.set = rtl8366rb_sw_set_mirror_rx_enable,
@@ -1251,6 +1535,48 @@ static struct switch_attr rtl8366rb_port[] = {
 		.max = RTL8366RB_BDTH_SW_MAX,
 		.set = rtl8366rb_sw_set_port_rate_out,
 		.get = rtl8366rb_sw_get_port_rate_out,
+	}, {
+		.type = SWITCH_TYPE_INT,
+		.name = "priority",
+		.description = "Get/Set port priority (0-7)",
+		.set = rtl8366rb_sw_set_port_pri,
+		.get = rtl8366rb_sw_get_port_pri,
+		.max = 7
+	}, {
+		.type = SWITCH_TYPE_INT,
+		.name = "bc_storm_filter",
+		.description = "Get/Set broadcast storm filtering (enabled or disabled)",
+		.max = 1,
+		.set = rtl8366rb_sw_set_port_bc_stfilter,
+		.get = rtl8366rb_sw_get_port_bc_stfilter,
+	}, {
+		.type = SWITCH_TYPE_INT,
+		.name = "mc_storm_filter",
+		.description = "Get/Set multicast storm filtering (enabled or disabled)",
+		.max = 1,
+		.set = rtl8366rb_sw_set_port_mc_stfilter,
+		.get = rtl8366rb_sw_get_port_mc_stfilter,
+	}, {
+		.type = SWITCH_TYPE_INT,
+		.name = "ua_storm_filter",
+		.description = "Get/Set unknown address storm filtering (enabled or disabled)",
+		.max = 1,
+		.set = rtl8366rb_sw_set_port_ua_stfilter,
+		.get = rtl8366rb_sw_get_port_ua_stfilter,
+	}, {
+		.type = SWITCH_TYPE_INT,
+		.name = "um_storm_filter",
+		.description = "Get/Set unknown multicast storm filtering (enabled or disabled)",
+		.max = 1,
+		.set = rtl8366rb_sw_set_port_um_stfilter,
+		.get = rtl8366rb_sw_get_port_um_stfilter,
+	}, {
+		.type = SWITCH_TYPE_INT,
+		.name = "storm_filter_rate",
+		.description = "Get/Set storm filtering rate in kbps",
+		.max = RTL8366RB_STORM_RATE_MAX,
+		.set = rtl8366rb_sw_set_port_stfilter_rate,
+		.get = rtl8366rb_sw_get_port_stfilter_rate,
 	},
 };
 
@@ -1492,5 +1818,6 @@ MODULE_AUTHOR("Gabor Juhos <juhosg@openwrt.org>");
 MODULE_AUTHOR("Antti Seppälä <a.seppala@gmail.com>");
 MODULE_AUTHOR("Roman Yeryomin <roman@advem.lv>");
 MODULE_AUTHOR("Colin Leitner <colin.leitner@googlemail.com>");
+MODULE_AUTHOR("Luca Niccoli <lultimouomo@gmail.com>");
 MODULE_LICENSE("GPL v2");
 MODULE_ALIAS("platform:" RTL8366RB_DRIVER_NAME);
