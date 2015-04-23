@@ -97,7 +97,7 @@ define Build/Configure
 
 	# Enforce that all replacements are made, otherwise options.h has changed
 	# format and this logic is broken.
-	for OPTION in DROPBEAR_ECDSA DROPBEAR_ECDH; do \
+	for OPTION in DROPBEAR_ECDSA DROPBEAR_ECDH DROPBEAR_SHA2_256_HMAC DROPBEAR_SHA2_512_HMAC; do \
 	  awk 'BEGIN { rc = 1 } \
 	       /'$$$$OPTION'/ { $$$$0 = "$(if $(CONFIG_DROPBEAR_ECC),,// )#define '$$$$OPTION'"; rc = 0 } \
 	       { print } \
